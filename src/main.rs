@@ -1,6 +1,5 @@
 //! A Claude Code `PreToolUse` hook that pauses tool calls during Anthropic's weekday
-//! peak window (Mon-Fri 05:00-11:00 US Pacific, about 01:00-07:00 NZDT Tue-Sat),
-//! when session limits drain faster.
+//! peak window (Mon-Fri 05:00-11:00 US Pacific), when session limits drain faster.
 //!
 //! Inside the window every tool call is denied except git and gh commands and a
 //! few coordination tools, so running agents commit, push and stop, and nothing
@@ -8,20 +7,20 @@
 //! `jiff`, so daylight saving follows the database, not rules written here. It
 //! replaces `reference/peak-hours-guard.sh`, without starting a subprocess.
 //!
-//! Override: create `~/.claude/allow-peak-hours` to disable the guard until the
-//! file is removed. Testing: `PEAK_HOURS_NOW_EPOCH=<unix seconds>` pretends it
-//! is that moment.
+//! Override: `touch ~/.claude/allow-peak-hours` lets calls through for the peak
+//! window it was touched in, or the next one if touched outside a window, and the
+//! guard re-arms at the window after that. Testing: `PEAK_HOURS_NOW_EPOCH=<unix
+//! seconds>` pretends it is that moment.
 
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const PEAK_ZONE: &str = "America/Los_Angeles";
-
-const DENY_REASON: &str = "Peak-hour pause (Mon-Fri 05:00-11:00 US Pacific, about 01:00-07:00 NZDT): Claude limits drain faster now. Commit and push your work with git, append your state to your report file, then stop and wait; do not retry other tools. Override: touch ~/.claude/allow-peak-hours";
+const NZ_ZONE: &str = "Pacific/Auckland";
 
 /// Tools that coordinate running agents and never start new work.
 const ALWAYS_ALLOWED: &[&str] = &[
@@ -37,9 +36,41 @@ const ALWAYS_ALLOWED: &[&str] = &[
     "TaskOutput",
 ];
 
-/// Programs that mean a build or a test run, which git and gh commands must not run.
-const BUILD_WORDS: &[&str] = &[
+/// Programs that mean a build or a test run.
+const BUILD_PROGRAMS: &[&str] = &[
     "cargo", "rustc", "pixi", "mpirun", "pytest", "maturin", "nextest", "claude",
+];
+
+/// Shells, interpreters and wrappers, which can run a build out of sight
+/// (`bash -c 'cargo test'`, `env cargo build`).
+const HIDING_PROGRAMS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "python",
+    "python3",
+    "py",
+    "node",
+    "npx",
+    "bunx",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "eval",
+    "source",
+    "env",
+    "time",
+    "nice",
+    "nohup",
+    "exec",
+    "command",
+    "sudo",
+    "timeout",
+    "stdbuf",
+    "xargs",
 ];
 
 /// Whether `now` (Unix seconds) is inside Mon-Fri 05:00-11:00 US Pacific.
@@ -52,6 +83,69 @@ fn in_peak_window(now: i64) -> bool {
     };
     let weekday = local.weekday().to_monday_one_offset();
     weekday <= 5 && (5..11).contains(&local.hour())
+}
+
+/// The end of the first peak window that finishes after `after` (Unix seconds): 11:00
+/// Pacific on the first weekday whose 11:00 is still ahead.
+fn next_window_end(after: i64) -> Option<i64> {
+    let local = Timestamp::from_second(after).ok()?.in_tz(PEAK_ZONE).ok()?;
+    let mut date = local.date();
+    for _ in 0..8 {
+        if date.weekday().to_monday_one_offset() <= 5 {
+            let end = date
+                .at(11, 0, 0, 0)
+                .in_tz(PEAK_ZONE)
+                .ok()?
+                .timestamp()
+                .as_second();
+            if end > after {
+                return Some(end);
+            }
+        }
+        date = date.tomorrow().ok()?;
+    }
+    None
+}
+
+/// Whether an override file last modified at `modified` still applies at `now`: it
+/// covers the peak window it was touched in, or the next one, and no later.
+fn override_applies(modified: i64, now: i64) -> bool {
+    next_window_end(modified).is_none_or(|end| now < end)
+}
+
+/// The peak window as New Zealand clock times on the Pacific date of `now`, such as
+/// `02:00-08:00 NZDT`.
+fn window_in_new_zealand(now: i64) -> Option<String> {
+    let pacific = Timestamp::from_second(now).ok()?.in_tz(PEAK_ZONE).ok()?;
+    let date = pacific.date();
+    let at = |hour: i8| {
+        date.at(hour, 0, 0, 0)
+            .in_tz(PEAK_ZONE)
+            .ok()?
+            .in_tz(NZ_ZONE)
+            .ok()
+    };
+    let (start, end) = (at(5)?, at(11)?);
+    let name = if start.offset().seconds() >= 13 * 3600 {
+        "NZDT"
+    } else {
+        "NZST"
+    };
+    Some(format!(
+        "{:02}:00-{:02}:00 {name}",
+        start.hour(),
+        end.hour()
+    ))
+}
+
+/// What the denied agent is told.
+fn deny_reason(now: i64) -> String {
+    let local = window_in_new_zealand(now)
+        .map(|range| format!(", today {range}"))
+        .unwrap_or_default();
+    format!(
+        "Peak-hour pause (Mon-Fri 05:00-11:00 US Pacific{local}): Claude limits drain faster now. Commit and push your work with git, append your state to your report file, then stop and wait; do not retry other tools. Override for this window: touch ~/.claude/allow-peak-hours"
+    )
 }
 
 /// The text of a `$(...)` command substitution starting at `chars[start]` (the `$`),
@@ -203,56 +297,65 @@ fn without_quoted_text(command: &str) -> String {
     out
 }
 
-/// `command` without a leading `cd <dir> &&` or `cd <dir> ;`. A command without
-/// that prefix is returned untouched.
-fn without_leading_cd(command: &str) -> &str {
-    let Some(rest) = command.strip_prefix("cd ") else {
-        return command;
-    };
-    let Some(split) = rest.find(['&', ';', '|']) else {
-        return command;
-    };
-    if split == 0 {
-        return command;
-    }
-    let after = &rest[split..];
-    let tail = if let Some(tail) = after.strip_prefix(';') {
-        tail
-    } else if let Some(tail) = after.strip_prefix("&&") {
-        tail
-    } else {
-        return command;
-    };
-    tail.trim_start()
-}
-
-/// Whether `command` names a build or test program as a whole word, where a word
-/// is delimited by anything other than a lowercase letter or underscore.
-fn mentions_build_program(command: &str) -> bool {
-    let bytes = command.as_bytes();
-    let is_word_byte = |b: u8| b.is_ascii_lowercase() || b == b'_';
-    BUILD_WORDS.iter().any(|word| {
-        command.match_indices(word).any(|(at, _)| {
-            let before_ok = at == 0 || !is_word_byte(bytes[at - 1]);
-            let after = at + word.len();
-            let after_ok = after >= bytes.len() || !is_word_byte(bytes[after]);
-            before_ok && after_ok
-        })
+/// Whether `word` is a shell variable assignment such as `GH_TOKEN=abc`.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 
+/// The program a simple command runs: its first word that is not a variable
+/// assignment, without any directory or `.exe`, in lower case.
+fn program_of(segment: &str) -> Option<String> {
+    let word = segment
+        .split_whitespace()
+        .find(|word| !is_assignment(word))?;
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    Some(
+        name.strip_suffix(".exe")
+            .unwrap_or(name)
+            .to_ascii_lowercase(),
+    )
+}
+
+/// The simple commands of `code`, split at `;`, `&`, `|`, newlines, parentheses,
+/// braces and backticks (so also at `&&`, `||` and `$(`).
+fn simple_commands(code: &str) -> impl Iterator<Item = &str> {
+    code.split([';', '&', '|', '\n', '(', ')', '`', '{', '}'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+}
+
 /// Whether a shell command is a git or gh command that runs no build or test program.
-/// This is a cost guard for agents, not a sandbox.
+///
+/// Leading `cd`, `export` and `NAME=value` setup is skipped. The first program after
+/// that must be `git` or `gh`, and no later command may be a build program or a shell,
+/// interpreter or wrapper that could hide one. Quoted text is not code, so a commit
+/// message may say anything. This is a cost guard for agents, not a sandbox.
 fn is_git_command(command: &str) -> bool {
     let code = without_quoted_text(command);
-    let code = without_leading_cd(code.trim_start()).trim_start();
-    let is_git = code == "git"
-        || code == "gh"
-        || code.starts_with("git ")
-        || code.starts_with("gh ")
-        || code.starts_with("git\n")
-        || code.starts_with("gh\n");
-    is_git && !mentions_build_program(code)
+    let mut started = false;
+    for segment in simple_commands(&code) {
+        let Some(program) = program_of(segment) else {
+            continue; // only variable assignments
+        };
+        if program == "cd" || program == "export" {
+            continue;
+        }
+        if BUILD_PROGRAMS.contains(&program.as_str()) || HIDING_PROGRAMS.contains(&program.as_str())
+        {
+            return false;
+        }
+        if !started {
+            if program != "git" && program != "gh" {
+                return false;
+            }
+            started = true;
+        }
+    }
+    started
 }
 
 /// Whether the tool call (the hook's JSON input) is allowed during the peak window.
@@ -281,12 +384,24 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn main() {
-    // The override file disables the guard.
-    if home_dir().is_some_and(|home| home.join(".claude").join("allow-peak-hours").exists()) {
-        return;
-    }
+/// Whether `~/.claude/allow-peak-hours` exists and still applies at `now`. A file whose
+/// age cannot be read is taken to apply: a broken guard must not stop all work.
+fn override_file_applies(now: i64) -> bool {
+    let Some(path) = home_dir().map(|home| home.join(".claude").join("allow-peak-hours")) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs() as i64);
+    modified.is_none_or(|modified| override_applies(modified, now))
+}
 
+fn main() {
     let now = std::env::var("PEAK_HOURS_NOW_EPOCH")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
@@ -297,7 +412,7 @@ fn main() {
         });
 
     // Outside the window everything is allowed, and the input is never read.
-    if !in_peak_window(now) {
+    if !in_peak_window(now) || override_file_applies(now) {
         return;
     }
 
@@ -309,7 +424,14 @@ fn main() {
     }
 
     println!(
-        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"{DENY_REASON}\"}}}}"
+        "{}",
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": deny_reason(now),
+            }
+        })
     );
 }
 
@@ -333,6 +455,10 @@ mod tests {
 
     fn allowed(command: &str) -> bool {
         allowed_in_window(&call("Bash", command))
+    }
+
+    fn second(utc: &str) -> i64 {
+        utc.parse::<Timestamp>().expect("a timestamp").as_second()
     }
 
     #[test]
@@ -371,11 +497,66 @@ mod tests {
     }
 
     #[test]
+    fn the_window_ends_are_found_from_zoneinfo_windows_too() {
+        // Every window end from the zoneinfo data is what next_window_end finds from any
+        // second inside that window.
+        for line in ZONEINFO_WINDOWS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        {
+            let (start, end) = line.split_once(' ').expect("two fields per line");
+            let (start, end): (i64, i64) = (start.parse().unwrap(), end.parse().unwrap());
+            assert_eq!(next_window_end(start), Some(end), "from the start {start}");
+            assert_eq!(next_window_end(end - 1), Some(end), "from the last second");
+        }
+    }
+
+    #[test]
+    fn an_override_covers_its_own_window_or_the_next_and_then_re_arms() {
+        // Wednesday 2026-11-04: the window is 13:00-19:00 UTC (05:00-11:00 PST).
+        let during = second("2026-11-04T15:00:00Z");
+        let window_end = second("2026-11-04T19:00:00Z");
+        // Touched during a window: applies for the rest of it, not after.
+        assert!(override_applies(during, during + 60));
+        assert!(override_applies(during, window_end - 1));
+        assert!(!override_applies(during, window_end));
+        // The next day's window is guarded again.
+        assert!(!override_applies(during, second("2026-11-05T15:00:00Z")));
+        // Touched the evening before: covers the whole of the next window.
+        let evening = second("2026-11-04T06:00:00Z"); // Tuesday 22:00 PST
+        assert!(override_applies(evening, second("2026-11-04T13:00:00Z")));
+        assert!(override_applies(evening, window_end - 1));
+        assert!(!override_applies(evening, window_end));
+        // Touched on Friday evening: covers Monday's window, not Tuesday's.
+        let friday = second("2026-11-07T03:00:00Z"); // Friday 19:00 PST
+        assert!(override_applies(friday, second("2026-11-09T18:59:59Z")));
+        assert!(!override_applies(friday, second("2026-11-10T15:00:00Z")));
+        // A forgotten file from last week no longer applies.
+        assert!(!override_applies(second("2026-10-28T15:00:00Z"), during));
+    }
+
+    #[test]
+    fn the_message_gives_the_new_zealand_hours_for_the_time_of_year() {
+        // US standard time with NZ daylight time, US and NZ daylight time, US daylight
+        // time with NZ standard time.
+        let cases = [
+            ("2026-11-04T16:00:00Z", "02:00-08:00 NZDT"),
+            ("2026-10-14T16:00:00Z", "01:00-07:00 NZDT"),
+            ("2026-07-08T16:00:00Z", "00:00-06:00 NZST"),
+        ];
+        for (when, range) in cases {
+            assert_eq!(window_in_new_zealand(second(when)).as_deref(), Some(range));
+            assert!(deny_reason(second(when)).contains(range), "{when}");
+        }
+    }
+
+    #[test]
     fn git_and_gh_pass_but_builds_and_other_tools_do_not() {
         assert!(allowed("git status"));
         assert!(allowed("cd /tmp && git log"));
         assert!(allowed("gh pr view 5"));
         assert!(allowed("git add -A && git commit -m x && git push"));
+        assert!(allowed("git status | head"));
         assert!(!allowed("git log && cargo build"));
         assert!(!allowed("cargo test"));
         assert!(!allowed("ls"));
@@ -405,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn a_program_name_in_a_path_branch_or_option_is_not_a_build() {
+        assert!(allowed("git add .claude/settings.json"));
+        assert!(allowed("git add .cargo/config.toml"));
+        assert!(allowed("git checkout -b feature/pytest-fixes"));
+        assert!(allowed("git log --author=claude"));
+        assert!(allowed("git log --grep=cargos"));
+        assert!(allowed("git log my_cargo"));
+        assert!(allowed("gh pr create --title cargo --body-file -"));
+    }
+
+    #[test]
+    fn setup_before_git_is_skipped() {
+        assert!(allowed("GH_TOKEN=x gh issue edit 5"));
+        assert!(allowed("export GH_TOKEN=x; gh issue edit 5"));
+        assert!(allowed(
+            "GH_TOKEN=$(gh auth token --user jesserobertson) gh issue edit 5"
+        ));
+        assert!(allowed("cd a && cd b && git status"));
+        assert!(allowed("git\tstatus"));
+        assert!(allowed("cd a | git status"));
+        // Setup alone is not a git command.
+        assert!(!allowed("cd a && cd b"));
+        assert!(!allowed("export X=1"));
+        assert!(!allowed("ls && git status"));
+    }
+
+    #[test]
     fn a_build_that_would_run_is_denied_wherever_it_hides() {
         assert!(!allowed("git log $(cargo build)"));
         assert!(!allowed(r#"git log "$(cargo build)""#));
@@ -415,8 +623,15 @@ mod tests {
         assert!(!allowed(
             "git commit -F - <<'EOF'\nmessage\nEOF\ncargo test"
         ));
-        // Text after a quoted heredoc's closing line is code again.
         assert!(!allowed("git status\ncargo build"));
+        assert!(!allowed("git status && /usr/bin/cargo build"));
+        assert!(!allowed("git status && CARGO_TERM_COLOR=never cargo build"));
+        assert!(!allowed("git status && cargo.exe build"));
+        // Shells, interpreters and wrappers can hide a build in quoted text.
+        assert!(!allowed("git status && bash -c 'cargo test'"));
+        assert!(!allowed("git status && env cargo build"));
+        assert!(!allowed("git status && python run_tests.py"));
+        assert!(!allowed("git ls-files | xargs cargo fmt"));
     }
 
     #[test]
@@ -439,11 +654,5 @@ mod tests {
             }
         }
         visit(&mut String::new(), 5);
-    }
-
-    #[test]
-    fn a_program_name_inside_a_longer_word_is_not_a_build() {
-        assert!(allowed("git log --grep=cargos"));
-        assert!(allowed("git log my_cargo"));
     }
 }
