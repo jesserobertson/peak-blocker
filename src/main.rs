@@ -5,7 +5,7 @@
 //! few coordination tools, so running agents commit, push and stop, and nothing
 //! new starts. The Pacific time comes from the IANA timezone database bundled by
 //! `jiff`, so daylight saving follows the database, not rules written here. It
-//! replaces `reference/peak-hours-guard.sh`, without starting a subprocess.
+//! starts no subprocess.
 //!
 //! Override: `touch ~/.claude/allow-peak-hours` lets calls through for the peak
 //! window it was touched in, or the next one if touched outside a window, and the
@@ -13,7 +13,7 @@
 //! seconds>` pretends it is that moment.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
@@ -35,6 +35,9 @@ const ALWAYS_ALLOWED: &[&str] = &[
     "ToolSearch",
     "TaskOutput",
 ];
+
+/// The tools that write a file, allowed only inside the report directory.
+const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
 
 /// Programs that mean a build or a test run.
 const BUILD_PROGRAMS: &[&str] = &[
@@ -138,14 +141,57 @@ fn window_in_new_zealand(now: i64) -> Option<String> {
     ))
 }
 
-/// What the denied agent is told.
-fn deny_reason(now: i64) -> String {
+/// What the denied agent is told. `report_dir` is where it may write its state.
+fn deny_reason(now: i64, report_dir: Option<&Path>) -> String {
     let local = window_in_new_zealand(now)
         .map(|range| format!(", today {range}"))
         .unwrap_or_default();
+    let report = report_dir
+        .map(|dir| {
+            format!(
+                "write your state to a file under {} (Write and Edit are allowed there and nowhere else)",
+                dir.display()
+            )
+        })
+        .unwrap_or_else(|| "note your state in your final message".to_string());
     format!(
-        "Peak-hour pause (Mon-Fri 05:00-11:00 US Pacific{local}): Claude limits drain faster now. Commit and push your work with git, append your state to your report file, then stop and wait; do not retry other tools. Override for this window: touch ~/.claude/allow-peak-hours"
+        "Peak-hour pause (Mon-Fri 05:00-11:00 US Pacific{local}): Claude limits drain faster now. Commit and push your work with git, {report}, then stop and wait; do not retry other tools. Override for this window: touch ~/.claude/allow-peak-hours"
     )
+}
+
+/// The directory where an agent may write its state during the window: the value of
+/// `PEAK_BLOCKER_REPORT_DIR`, else `~/.claude/peak-reports`.
+fn report_dir() -> Option<PathBuf> {
+    std::env::var_os("PEAK_BLOCKER_REPORT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".claude").join("peak-reports")))
+}
+
+/// The parts of `path` with `.` and `..` resolved, lower-cased where the file system
+/// ignores case. `None` if a `..` climbs above the root.
+fn path_parts(path: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other if cfg!(windows) => parts.push(other.to_lowercase()),
+            other => parts.push(other.to_string()),
+        }
+    }
+    Some(parts)
+}
+
+/// Whether `path` is an absolute path to something inside `dir`. The comparison is on
+/// whole path parts, so `peak-reports-other` is not inside `peak-reports`.
+fn is_inside(path: &str, dir: &Path) -> bool {
+    let absolute = path.starts_with(['/', '\\']) || path.as_bytes().get(1) == Some(&b':');
+    let (Some(path), Some(dir)) = (path_parts(path), path_parts(&dir.to_string_lossy())) else {
+        return false;
+    };
+    absolute && !dir.is_empty() && path.len() > dir.len() && path[..dir.len()] == dir[..]
 }
 
 /// The text of a `$(...)` command substitution starting at `chars[start]` (the `$`),
@@ -359,14 +405,20 @@ fn is_git_command(command: &str) -> bool {
 }
 
 /// Whether the tool call (the hook's JSON input) is allowed during the peak window.
-/// Input that is not valid JSON names no tool and is not allowed.
-fn allowed_in_window(input: &str) -> bool {
+/// Input that is not valid JSON names no tool and is not allowed. `report_dir` is the
+/// only place the file-writing tools may write.
+fn allowed_in_window(input: &str, report_dir: Option<&Path>) -> bool {
     let Ok(call) = serde_json::from_str::<Value>(input) else {
         return false;
     };
     let tool = call["tool_name"].as_str().unwrap_or_default();
     if ALWAYS_ALLOWED.contains(&tool) {
         return true;
+    }
+    if WRITE_TOOLS.contains(&tool) {
+        return report_dir
+            .zip(call["tool_input"]["file_path"].as_str())
+            .is_some_and(|(dir, path)| is_inside(path, dir));
     }
     if tool == "Bash" || tool == "PowerShell" {
         return call["tool_input"]["command"]
@@ -419,7 +471,8 @@ fn main() {
     let mut raw = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut raw);
     let input = String::from_utf8_lossy(&raw);
-    if allowed_in_window(&input) {
+    let report_dir = report_dir();
+    if allowed_in_window(&input, report_dir.as_deref()) {
         return;
     }
 
@@ -429,7 +482,7 @@ fn main() {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": deny_reason(now),
+                "permissionDecisionReason": deny_reason(now, report_dir.as_deref()),
             }
         })
     );
@@ -454,7 +507,7 @@ mod tests {
     }
 
     fn allowed(command: &str) -> bool {
-        allowed_in_window(&call("Bash", command))
+        allowed_in_window(&call("Bash", command), None)
     }
 
     fn second(utc: &str) -> i64 {
@@ -546,7 +599,7 @@ mod tests {
         ];
         for (when, range) in cases {
             assert_eq!(window_in_new_zealand(second(when)).as_deref(), Some(range));
-            assert!(deny_reason(second(when)).contains(range), "{when}");
+            assert!(deny_reason(second(when), None).contains(range), "{when}");
         }
     }
 
@@ -560,10 +613,108 @@ mod tests {
         assert!(!allowed("git log && cargo build"));
         assert!(!allowed("cargo test"));
         assert!(!allowed("ls"));
-        assert!(allowed_in_window(&call("ToolSearch", "")));
-        assert!(!allowed_in_window(&call("Edit", "")));
-        assert!(!allowed_in_window("not json"));
-        assert!(!allowed_in_window(""));
+        assert!(allowed_in_window(&call("ToolSearch", ""), None));
+        assert!(!allowed_in_window(&call("Edit", ""), None));
+        assert!(!allowed_in_window("not json", None));
+        assert!(!allowed_in_window("", None));
+    }
+
+    #[cfg(windows)]
+    const REPORT_DIR: &str = r"C:\Users\me\.claude\peak-reports";
+    #[cfg(not(windows))]
+    const REPORT_DIR: &str = "/home/me/.claude/peak-reports";
+
+    fn write_call(tool: &str, path: &str) -> String {
+        json!({"tool_name": tool, "tool_input": {"file_path": path}}).to_string()
+    }
+
+    /// Whether `tool` may write `path` with the report directory in place.
+    fn may_write(tool: &str, path: &str) -> bool {
+        allowed_in_window(&write_call(tool, path), Some(Path::new(REPORT_DIR)))
+    }
+
+    #[test]
+    fn the_file_tools_may_write_only_inside_the_report_directory() {
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert!(may_write(tool, &format!("{REPORT_DIR}/state.md")), "{tool}");
+            assert!(
+                may_write(tool, &format!("{REPORT_DIR}/agent/state.md")),
+                "{tool}"
+            );
+            assert!(
+                may_write(tool, &format!("{REPORT_DIR}/./a/../state.md")),
+                "{tool}"
+            );
+            // The directory itself is not a file inside it.
+            assert!(!may_write(tool, REPORT_DIR), "{tool}");
+            // A sibling that merely starts with the same letters is not inside.
+            assert!(
+                !may_write(tool, &format!("{REPORT_DIR}-other/state.md")),
+                "{tool}"
+            );
+            // `..` cannot climb out of it.
+            assert!(
+                !may_write(tool, &format!("{REPORT_DIR}/../../elsewhere.md")),
+                "{tool}"
+            );
+            assert!(
+                !may_write(tool, &format!("{REPORT_DIR}/../state.md")),
+                "{tool}"
+            );
+            // Only an absolute path counts.
+            assert!(!may_write(tool, ".claude/peak-reports/state.md"), "{tool}");
+            assert!(
+                !may_write(tool, REPORT_DIR.trim_start_matches(['/', '\\'])),
+                "{tool}"
+            );
+            assert!(!may_write(tool, "src/main.rs"), "{tool}");
+            assert!(!may_write(tool, ""), "{tool}");
+        }
+        // No other tool writes, and Bash stays git-only.
+        assert!(!may_write(
+            "NotebookEdit",
+            &format!("{REPORT_DIR}/state.md")
+        ));
+        assert!(!allowed(&format!("echo done >> {REPORT_DIR}/state.md")));
+        // Without a report directory nothing may be written.
+        let call = write_call("Write", &format!("{REPORT_DIR}/state.md"));
+        assert!(!allowed_in_window(&call, None));
+        assert!(!allowed_in_window(
+            &json!({"tool_name": "Write"}).to_string(),
+            Some(Path::new(REPORT_DIR))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_compared_without_regard_to_case_or_separator() {
+        assert!(may_write(
+            "Write",
+            r"C:\USERS\ME\.CLAUDE\PEAK-REPORTS\State.md"
+        ));
+        assert!(may_write(
+            "Write",
+            "c:/users/me/.claude/peak-reports/state.md"
+        ));
+        assert!(!may_write(
+            "Write",
+            r"D:\Users\me\.claude\peak-reports\state.md"
+        ));
+    }
+
+    #[test]
+    fn the_message_names_the_report_directory() {
+        let now = second("2026-11-04T16:00:00Z");
+        let with = deny_reason(now, Some(Path::new(REPORT_DIR)));
+        assert!(
+            with.contains(REPORT_DIR) && with.contains("nowhere else"),
+            "{with}"
+        );
+        let without = deny_reason(now, None);
+        assert!(
+            !without.contains("peak-reports") && without.contains("final message"),
+            "{without}"
+        );
     }
 
     #[test]

@@ -6,15 +6,17 @@ window, when session limits drain faster.
 **The window** is Monday to Friday, 05:00 to 11:00 US Pacific, which is Tuesday to Saturday
 in New Zealand at hours that shift with both countries' daylight saving (the denial message
 gives today's NZ hours). Outside it the hook does nothing. Inside it every tool call is
-denied except `git` and `gh` commands (that run no build or test program such as `cargo` or
-`pytest`) and a few tools that coordinate running agents, so agents commit, push and stop,
-and nothing new starts.
+denied except:
 
-It replaces a shell script that did the same thing with about ten subprocesses per tool
-call. That script is kept in [`reference/`](reference/peak-hours-guard.sh) as the thing this
-tool is checked against. A hook runs before every tool call, so its cost is paid hundreds of
-times a session. On Windows, a call took about 410 ms with the script and about 35 ms with
-this binary, which is the cost of starting any process there.
+- `git` and `gh` commands that run no build or test program such as `cargo` or `pytest`;
+- the `Write` and `Edit` tools, for files inside one report directory;
+- a few tools that coordinate running agents.
+
+So agents commit, push, record their state and stop, and nothing new starts.
+
+A hook runs before every tool call, so it has to be cheap. This is one small binary that
+starts no subprocess. On Windows a call takes about 35 ms, which is the cost of starting any
+process there.
 
 ## Install
 
@@ -46,6 +48,17 @@ To manage it with [chezmoi](https://www.chezmoi.io/), run the `cargo install` li
 `run_onchange_after_` script in your dotfiles, and keep the settings entry above in your
 templated `settings.json`.
 
+## Report files
+
+During the window the file-writing tools (`Write`, `Edit`, `MultiEdit`) may write inside one
+directory and nowhere else: `~/.claude/peak-reports/`, or the directory named by
+`PEAK_BLOCKER_REPORT_DIR`. The denial message tells the agent where it is. Bash is still
+limited to git and gh, so `echo >> file` is not a way around it.
+
+The check is on whole path parts, after resolving `.` and `..`, and the path must be absolute.
+`peak-reports-other/` is not inside `peak-reports/`, and `peak-reports/../x` is not either.
+On Windows the comparison ignores case and accepts either slash.
+
 ## Override and testing
 
 - `touch ~/.claude/allow-peak-hours` lets calls through for the peak window it was touched
@@ -53,8 +66,8 @@ templated `settings.json`.
   window after that. Touch it during a window and it lasts until 11:00 Pacific; touch it the
   evening before and it covers the next morning. The file does not need removing, and a
   forgotten one from last week is ignored.
-- `PEAK_HOURS_NOW_EPOCH=<unix seconds>` makes it behave as if it were that moment, which is
-  how the tests and the comparison script drive it.
+- `PEAK_HOURS_NOW_EPOCH=<unix seconds>` makes it behave as if it were that moment, for
+  trying it out.
 
 ## How it decides
 
@@ -92,40 +105,18 @@ git status && bash -c 'cargo test'        # denied
 This is a cost guard for agents, not a sandbox: the command is read by a small scanner, not
 a full shell parser.
 
-### What changed from the shell script
-
-The script read the command with `sed`, took any build program's name anywhere in the text
-as a build, and handled only one leading `cd`. Compared with it, this tool:
-
-- parses the JSON, so quoted commit messages, heredocs and leading spaces are allowed;
-- looks at the program a command runs, so `.claude/` and `.cargo/` paths, branch names and
-  `--author=claude` are allowed;
-- skips `NAME=value` and `export NAME=value;` before git or gh and any number of `cd`
-  steps, and accepts a tab after `git`;
-- denies a shell, interpreter or wrapper after the first git command (the script allowed
-  `git status && python x.py`), because quoted text no longer counts as a build;
-- gives the New Zealand hours for the time of year in the denial message (the script always
-  said 01:00 to 07:00 NZDT);
-- applies an override only to one window instead of until the file is removed.
-
-`scripts/compare_with_script.py` asserts these as the only differences.
-
-## Checking it
+## Tests
 
 ```sh
+cargo test
 python scripts/gen_window_intervals.py   # regenerate the zoneinfo answers (needs tzdata on Windows)
-cargo test                               # the window against Python's zoneinfo, hour by hour, 2024-2030
-cargo build --release
-python scripts/compare_with_script.py    # same decisions as the shell script, apart from the intended ones
 ```
 
 `cargo test` checks the first and last second of every hour from 2024 to 2030 against
-answers produced by Python's `zoneinfo`, an independent implementation, covering seven
-spring and seven autumn clock changes. `compare_with_script.py` runs the binary and the
-script on the edges of the window and a spread of tool calls and compares whether each call
-is denied.
-On Windows the script needs Git Bash, not the WSL `bash`; set `GIT_BASH` if it is not under
-`C:/Program Files/Git`.
+answers produced by Python's `zoneinfo`, an independent implementation of the timezone
+rules, covering seven spring and seven autumn clock changes. It also covers the command
+rules, the report directory, the override, the New Zealand hours in the message, and that the
+command scanner cannot panic on any short run of quotes, heredocs and substitutions.
 
 ## Releasing
 
