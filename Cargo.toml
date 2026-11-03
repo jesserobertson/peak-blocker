@@ -1,6 +1,6 @@
 [package]
 name = "peak-blocker"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A Claude Code PreToolUse hook that pauses tool calls during Anthropic's weekday peak window."
 license = "MIT"
