@@ -20,6 +20,9 @@ hundreds of times a session.
 cargo install --git https://github.com/jesserobertson/peak-blocker --locked --root ~/.claude/hooks
 ```
 
+Once a version is published to crates.io, `cargo install peak-blocker --locked --root ~/.claude/hooks`
+does the same.
+
 This puts the binary at `~/.claude/hooks/bin/peak-blocker` (`peak-blocker.exe` on Windows).
 Then point the hook at it in `~/.claude/settings.json`:
 
@@ -78,6 +81,17 @@ spring and seven autumn clock changes. `compare_with_script.py` runs the binary 
 script on the edges of the window and a spread of tool calls and compares their output.
 On Windows the script needs Git Bash, not the WSL `bash`; set `GIT_BASH` if it is not under
 `C:/Program Files/Git`.
+
+## Releasing
+
+CI runs the formatter, clippy and the tests on Linux and Windows. Publishing is a tag:
+
+1. Add a crates.io API token with the publish scope as the repository secret
+   `CARGO_REGISTRY_TOKEN`.
+2. Set the version in `Cargo.toml`, commit, then `git tag v<version>` and `git push --tags`.
+
+The publish workflow refuses a tag that does not match the version in `Cargo.toml`, runs the
+tests, and runs `cargo publish --locked`.
 
 ## License
 
