@@ -21,11 +21,11 @@ process there.
 ## Install
 
 ```sh
-cargo install --git https://github.com/jesserobertson/peak-blocker --locked --root ~/.claude/hooks
+cargo install peak-blocker --locked --root ~/.claude/hooks
 ```
 
-Once a version is published to crates.io, `cargo install peak-blocker --locked --root ~/.claude/hooks`
-does the same.
+To install the latest unreleased commit instead, use
+`cargo install --git https://github.com/jesserobertson/peak-blocker --locked --root ~/.claude/hooks`.
 
 This puts the binary at `~/.claude/hooks/bin/peak-blocker` (`peak-blocker.exe` on Windows).
 Then point the hook at it in `~/.claude/settings.json`:
