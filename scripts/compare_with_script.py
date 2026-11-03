@@ -71,6 +71,21 @@ logic_calls += ['{"nothing":"useful"}', ""]
 
 cases = [(epoch, edge_call) for epoch in edge_instants] + [(inside, call) for call in logic_calls]
 
+# The script reads the command with sed, so it denies any git command whose JSON holds an
+# escape (a quoted commit message, a heredoc) or that starts with spaces. The binary parses
+# the JSON and allows them. These are the only intended differences.
+git_commands_the_script_wrongly_denies = {
+    payload("Bash", c)
+    for c in (
+        'git commit -m "tidy cargo notes"',
+        "  git status",
+        "git commit -F - <<EOF\nmessage\nEOF",
+        "git commit -F - <<'EOF'\nCo-Authored-By: Claude\nEOF",
+    )
+}
+logic_calls += list(git_commands_the_script_wrongly_denies - set(logic_calls))
+cases = [(epoch, edge_call) for epoch in edge_instants] + [(inside, call) for call in logic_calls]
+
 # A home directory with no override file, so the guard is not switched off.
 home = tempfile.mkdtemp()
 base_env = dict(os.environ, HOME=home, USERPROFILE=home)
@@ -86,7 +101,12 @@ mismatches = 0
 for epoch, data in cases:
     expected = run([bash, script], epoch, data)
     actual = run([binary], epoch, data)
-    if expected != actual:
+    if data in git_commands_the_script_wrongly_denies:
+        # Intended difference: the script denies, the binary allows with no output.
+        if not (expected[1] and actual == (0, "")):
+            mismatches += 1
+            print("UNEXPECTED", data[:100].replace("\n", "\\n"), "script:", expected, "binary:", actual)
+    elif expected != actual:
         mismatches += 1
         when = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
         print("MISMATCH", epoch, when, "input", data[:100].replace("\n", "\\n"))

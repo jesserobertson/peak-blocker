@@ -55,16 +55,37 @@ templated `settings.json`.
 - The time comes from the IANA timezone database for `America/Los_Angeles`, bundled into the
   binary by [`jiff`](https://crates.io/crates/jiff). Daylight saving follows the database,
   not rules written in this repository.
-- The tool call is read from the JSON on standard input without a JSON parser, the way the
-  shell script's `sed` reads it. Outside the window the input is never read.
+- The tool call is parsed as JSON from standard input. Outside the window the input is never
+  read. Input that is not valid JSON names no tool and is denied inside the window.
+- A shell command is allowed when it is a `git` or `gh` command (after an optional leading
+  `cd <dir> &&`) that runs no build or test program: `cargo`, `rustc`, `pixi`, `mpirun`,
+  `pytest`, `maturin`, `nextest` or `claude`.
 
-### Known behaviour inherited from the script
+### Commit messages and heredocs
 
-A command that contains an escape in the JSON, such as a quoted commit message
-(`git commit -m "..."`, which arrives as `\"`) or a heredoc (`\n`), cannot be read that way,
-so during the window it is **denied** even though it is a git command. A command with
-leading spaces is also denied. This matches the script on purpose, so that the binary is a
-drop-in replacement. Both are probably bugs, and parsing the JSON properly is the fix.
+The text of quoted strings and heredoc bodies is ignored when looking for those programs, so
+`git commit -m "fix the cargo notes"` and a heredoc message with a `Co-Authored-By: Claude`
+trailer are allowed. Anything that would run is still checked, including command
+substitutions inside double quotes and unquoted heredocs:
+
+```sh
+git commit -m "fix the cargo notes"       # allowed
+git commit -F - <<'EOF' ... Claude ... EOF # allowed
+git log $(cargo build)                    # denied
+git log "$(cargo build)"                  # denied
+git commit -m x && cargo test             # denied
+```
+
+This is a cost guard for agents, not a sandbox: the command is read by a small scanner, not
+a full shell parser.
+
+### What changed from the shell script
+
+The script read the command with `sed`, so it could not read a command whose JSON holds an
+escape, and it denied every quoted commit message, every heredoc and every command with
+leading spaces, even though they are git commands. This tool parses the JSON, so it allows
+them. Those are the only intended differences, and `scripts/compare_with_script.py` asserts
+exactly that.
 
 ## Checking it
 

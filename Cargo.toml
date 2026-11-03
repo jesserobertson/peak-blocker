@@ -9,6 +9,7 @@ readme = "README.md"
 
 [dependencies]
 jiff = { version = "0.2.39", default-features = false, features = ["std", "tzdb-bundle-always"] }
+serde_json = "1.0.154"
 
 [profile.release]
 opt-level = 3
